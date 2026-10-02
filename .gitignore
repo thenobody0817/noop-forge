@@ -118,3 +118,6 @@ tools/linux-capture/*.db
 tools/linux-capture/*.db-wal
 tools/linux-capture/*.db-shm
 tools/linux-capture/captures/
+
+# Local Android build env helper (JDK + SDK paths), not shared.
+.envrc-android

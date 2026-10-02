@@ -4,6 +4,7 @@ import androidx.compose.ui.graphics.Color
 import com.noop.R
 import com.noop.analytics.Baselines
 import com.noop.analytics.SkinTempDisplay
+import com.noop.analytics.Spo2Display
 import com.noop.analytics.VitalBands
 import com.noop.data.DailyMetric
 import java.time.LocalDate
@@ -342,6 +343,22 @@ internal fun vitalsFor(
     val spo2RawMean: (DailyMetric) -> Double? = { row ->
         if (row.spo2Red != null && row.spo2Ir != null) (row.spo2Red + row.spo2Ir) / 2.0 else null
     }
+    // SpO₂ goes through `Spo2Display`, the shared decision both platforms now use, so the tile cannot
+    // drift away from what Today shows. Behaviour here is UNCHANGED: Android resolves the SELECTED day
+    // and has no carry on this surface, and [spo2CandidateByDay] is already empty when the experimental
+    // toggle is off, so passing the toggle through is belt-and-braces. What changes is that the rule is
+    // now stated once, in the engine both platforms share, rather than re-spelled per screen — which is
+    // exactly how Apple's Vital Signs section kept showing a months-old import while its own Today screen
+    // had already moved to recency-first.
+    val spo2Resolved = Spo2Display.resolve(
+        todayPct = d?.spo2Pct,
+        candidatePct = d?.day?.let { spo2CandidateByDay[it] },
+        candidateEnabled = spo2ToggleOn,
+        // This surface shows one selected day and never reaches back for an older reading, so there is no
+        // carried measurement to offer. Apple's `logicalDay ?? most recent` row selection is deliberate and
+        // stays there; only the CHOICE between measurement and candidate is shared.
+        carriedPct = null,
+    )
     val spo2rawRangeCaption =
         rangeCaption(days.mapNotNull(spo2RawMean), "ADC") { String.format(Locale.US, "%.0f", it) }
     return listOf(
@@ -374,7 +391,7 @@ internal fun vitalsFor(
             else if (d?.spo2Pct == null && spo2ToggleOn && spo2CandidateByDay.isEmpty())
                 uiString(R.string.spo2_toggle_on_no_data)
             else uiString(spo2MissingCaptionRes(d?.let(spo2RawMean) != null)),
-            value = d?.spo2Pct ?: d?.day?.let { spo2CandidateByDay[it] },
+            value = spo2Resolved?.percent,
             format = { String.format("%.0f", it) },
             deltaText = deltaText(d?.spo2Pct, previous { it.spo2Pct }, decimals = 0),
             readingDay = todayKey,
@@ -382,11 +399,13 @@ internal fun vitalsFor(
             rangeCaption = spo2RangeCaption,
             // Population-only on purpose: an absolute <95% floor is meaningful regardless
             // of personal baseline (no "spo2" MetricCfg exists).
-            banding = VitalBands.band(d?.spo2Pct ?: d?.day?.let { spo2CandidateByDay[it] }, emptyList(), 95.0..100.0, null),
+            banding = VitalBands.band(spo2Resolved?.percent, emptyList(), 95.0..100.0, null),
             metricColor = Palette.metricCyan,
             sparkline = trail(d?.spo2Pct) { it.spo2Pct },
             // #103: mark as estimate when the value came from the candidate, not a calibrated spo2Pct.
-            isEstimate = d?.spo2Pct == null && d?.day?.let { spo2CandidateByDay[it] } != null,
+            // The provenance now comes from the engine rather than being re-derived from the same two
+            // expressions, so the caption can never disagree with the number above it.
+            isEstimate = spo2Resolved?.provenance == Spo2Display.Provenance.CANDIDATE,
         ),
         Vital(
             // Issue #93: WHOOP 4.0 raw SpO₂ PPG ADC mean (red+IR)/2 per night. NOT a calibrated

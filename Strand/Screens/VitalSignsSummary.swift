@@ -202,13 +202,39 @@ enum BodyVitalSigns {
         let skinAbsPoints = points(key: "skin", \.skinTempC)
 
         let respRow = latest(respPoints)
-        // #103/queue-11a: fall back to the spo2_candidate mean when no calibrated spo2Pct exists. The
-        // candidate is labelled "strap estimate (unverified)" in the tile caption so it is never read as
-        // a calibrated blood-oxygen percentage.
-        let spo2Row = latest(spo2Points) ?? latest(spo2CandidatePoints)
-        let spo2IsCandidate = spo2Row != nil && latest(spo2Points) == nil
+        // SpO₂ resolves through `Spo2Display` rather than "any calibrated value wins".
+        //
+        // This line used to read `latest(spo2Points) ?? latest(spo2CandidatePoints)`, which is the rule
+        // `Spo2Display` was written to replace, and Today already resolves through it — so the same wearer
+        // could see two different numbers for the same night depending on which screen they opened. It is
+        // wrong across days, not within one: a calibrated import ending on 1 June left a value in the carry
+        // that outranked every fresh nightly estimate, so this tile showed 1 June for three and a half
+        // months while the strap estimated afresh behind it. Within ONE day a measurement still beats an
+        // estimate, which is why the resolver orders by RECENCY first and strength second rather than
+        // simply preferring measurements.
+        //
+        // `Spo2Display.Resolved` carries the value and its provenance but not the day, so the winning
+        // `VitalPoint` is recovered from the series the provenance names. A carried measurement keeps the
+        // older day, so this tile's `· 1 Jun ·` caption still dates what it is showing.
+        let spo2MeasuredPoint = latest(spo2Points)
+        let spo2CandidatePoint = latest(spo2CandidatePoints)
+        let spo2MeasuredIsToday = spo2MeasuredPoint?.day == logicalDay
+        let spo2Resolved = Spo2Display.resolve(
+            todayPct: spo2MeasuredIsToday ? spo2MeasuredPoint?.value : nil,
+            candidatePct: spo2CandidatePoint?.day == logicalDay ? spo2CandidatePoint?.value : nil,
+            candidateEnabled: spo2CandidateOn,
+            carriedPct: spo2MeasuredIsToday ? nil : spo2MeasuredPoint?.value
+        )
+        let spo2Row: VitalPoint? = switch spo2Resolved?.provenance {
+        case .measured, .measuredCarried: spo2MeasuredPoint
+        case .candidate: spo2CandidatePoint
+        case nil: nil
+        }
+        // The candidate is labelled "strap estimate (unverified)" in the tile caption so it is never read
+        // as a calibrated blood-oxygen percentage.
+        let spo2IsCandidate = spo2Resolved?.provenance == .candidate
         let spo2rawRow = latest(spo2rawPoints)
-        let rhrRow = latest(rhrPoints)
+        let rhrRow = latest(hrvPoints)
         let hrvRow = latest(hrvPoints)
         let skinRowDeviation = latest(skinPoints)
         // #1118: mark HRV "unverified" when this night's in-sleep R-R was over-counted — the WHOOP 4.0
