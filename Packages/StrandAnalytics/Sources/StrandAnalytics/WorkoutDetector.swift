@@ -24,16 +24,27 @@ public struct UserProfile: Equatable, Sendable {
     public var heightCm: Double
     public var age: Double
     public var sex: String   // "male" | "female" | "nonbinary"
+    /// Optional user-tested/manual maximum heart rate. Consumers fall back to Tanaka only when nil.
+    public var maxHR: Double?
     /// Counter ticks per real step for the @57 motion counter (#139). The WHOOP 5/MG
     /// counter overcounts and its true tick rate is unknown, so the daily-steps total
     /// divides by this. 1.0 = raw pass-through (default); the engine clamps ≥ 0.5.
     public var stepTicksPerStep: Double
+    /// The basal formula `Calories.bmrKcalPerDay(profile:)` evaluates. Harris–Benedict by default so a
+    /// profile built without one keeps the rate it always had; the app passes the wearer's choice.
+    public var basalFormula: BasalFormula
+    /// Body fat in force on the day this profile describes, for Katch–McArdle. Nil = no reading.
+    public var bodyFatPercent: Double?
     public init(weightKg: Double = 70.0, heightCm: Double = 170.0,
                 age: Double = 30.0, sex: String = "nonbinary",
-                stepTicksPerStep: Double = 1.0) {
+                stepTicksPerStep: Double = 1.0, maxHR: Double? = nil,
+                basalFormula: BasalFormula = .revisedHarrisBenedict, bodyFatPercent: Double? = nil) {
         self.weightKg = weightKg; self.heightCm = heightCm
         self.age = age; self.sex = sex
         self.stepTicksPerStep = stepTicksPerStep
+        self.maxHR = maxHR
+        self.basalFormula = basalFormula
+        self.bodyFatPercent = bodyFatPercent
     }
 
     /// Every stored field, for a cache key that must change when the profile does (the per-cycle load
@@ -42,6 +53,7 @@ public struct UserProfile: Equatable, Sendable {
     /// bit pattern, so the key is exact and locale-free. Twin of Kotlin `UserProfile.cacheKey`.
     public var cacheKey: String {
         "w=\(weightKg.bitPattern),h=\(heightCm.bitPattern),a=\(age.bitPattern),s=\(sex),t=\(stepTicksPerStep.bitPattern)"
+            + ",b=\(basalFormula.rawValue),f=\(bodyFatPercent?.bitPattern.description ?? "-")"
     }
 }
 
@@ -418,6 +430,10 @@ public enum WorkoutDetector {
     ///   - maxHR: HRmax (bpm). nil → estimated via StrainScorer.estimateHRmax.
     ///   - age: used only for the Tanaka fallback when maxHR is nil.
     ///   - profile: when provided, per-bout calories are estimated.
+    /// The sport a bout is priced as: the detector sees heart rate and motion, never what the activity
+    /// was, so a bout takes the generic curve and, without a ceiling, the table's unnamed-session MET.
+    static let detectedSport = "detected"
+
     public static func detect(hr: [HRSample],
                               gravity: [GravitySample],
                               restingHR: Double? = nil,
@@ -429,6 +445,10 @@ public enum WorkoutDetector {
                               // choice so a bout and the day it sits in are never scored by different
                               // recipes, which would be worse than either one being "wrong".
                               effortMethod: StrainScorer.Method = .edwards,
+                              // The day's aerobic ceiling (`PeakMETResolver`), so a detected bout is
+                              // priced on the curve the day's energy model uses. Nil prices it from the
+                              // table MET of an unnamed session.
+                              peakMET: Double? = nil,
                               // #1545: receives the gate-by-gate counts for THIS call. nil (the default)
                               // keeps every existing caller and test byte-identical — nothing is computed
                               // that the detector was not already computing, the counters just record it.
@@ -540,9 +560,10 @@ public enum WorkoutDetector {
             var kcal: Double? = nil
             var kj: Double? = nil
             if let profile = profile {
-                let (k, j) = Calories.estimateBoutCalories(hrSamples, profile: profile,
-                                                           hrmax: effMaxHR, restingHR: restHR)
-                kcal = k; kj = j
+                let k = WorkoutEnergyEstimate.boutKcal(hrSamples, sport: detectedSport, profile: profile,
+                                                       hrMax: effMaxHR, restingHR: restHR,
+                                                       peakMET: peakMET)
+                kcal = k; kj = k * 4.184
             }
 
             guard !bpms.isEmpty else { f.droppedNoHR += 1; continue }   // degenerate bout, no HR samples
@@ -664,9 +685,45 @@ public enum Calories {
     }
 
     static func restingKcalPerS(_ c: Coeffs, weightKg: Double, heightCm: Double, age: Double) -> Double {
+        max(0.0, bmrKcalPerDay(c, weightKg: weightKg, heightCm: heightCm, age: age)) / 86_400.0
+    }
+
+    /// The revised Harris–Benedict basal metabolic rate for a WHOLE day (kcal/24 h).
+    ///
+    /// Split out of `restingKcalPerS`, which has always computed exactly this and then divided by
+    /// 86 400 — so this is not a new formula, it is the same one at its natural unit. That matters:
+    /// NOOP must have ONE basal rate. A second formula anywhere would let two screens disagree about
+    /// the same body.
+    ///
+    /// APPROXIMATE, like everything in this file: a population regression on age/sex/height/weight,
+    /// not a measurement of this person's metabolism.
+    static func bmrKcalPerDay(_ c: Coeffs, weightKg: Double, heightCm: Double, age: Double) -> Double {
         let heightM = heightCm / 100.0
-        let bmr = c.restingAlpha + c.restingWeight * weightKg + c.restingHeight * heightM - c.restingAge * age
-        return max(0.0, bmr) / 86_400.0
+        return c.restingAlpha + c.restingWeight * weightKg + c.restingHeight * heightM - c.restingAge * age
+    }
+
+    /// The whole-day BMR for a profile, with the same defaults `estimateDayCalories` applies to a
+    /// blank profile (70 kg / 170 cm / 30 y). Nil when the profile carries no usable body data at
+    /// all — an invented basal rate is worse than an absent one, because everything downstream
+    /// (total burn, maintenance, a calorie target) would inherit the invention silently.
+    ///
+    /// `public`: the EnergyEngine is the first caller outside this file, and it must not re-derive
+    /// the formula.
+    ///
+    /// Evaluates `profile.basalFormula` (`BasalRate`). Every energy path — the day total, the strap
+    /// bucket model, the day's timeline, a session's tile — reads the basal rate through here, so one
+    /// choice reaches all of them; before this the Energy Plan's formula choice changed only the
+    /// Energy Plan. Katch–McArdle without a body-fat reading in force falls back to Mifflin–St Jeor,
+    /// the more accurate of the two height-and-weight regressions, rather than returning nothing.
+    public static func bmrKcalPerDay(profile: UserProfile) -> Double? {
+        guard profile.weightKg > 0, profile.heightCm > 0, profile.age > 0 else { return nil }
+        let formula: BasalFormula = profile.basalFormula == .katchMcArdle && profile.bodyFatPercent == nil
+            ? .mifflinStJeor : profile.basalFormula
+        return BasalRate.kcalPerDay(formula, weightKg: profile.weightKg, heightCm: profile.heightCm,
+                                    age: profile.age, sex: profile.sex,
+                                    bodyFatPercent: profile.bodyFatPercent)
+            ?? BasalRate.kcalPerDay(.mifflinStJeor, weightKg: profile.weightKg,
+                                    heightCm: profile.heightCm, age: profile.age, sex: profile.sex)
     }
 
     /// Uth–Sørensen VO2max estimate (ml·kg⁻¹·min⁻¹) ≈ 15.3 · HRmax / HRrest. Returns nil when no
@@ -750,6 +807,39 @@ public enum Calories {
             }
         }
         return (totalKcal, totalKcal * 4.184)
+    }
+
+    /// Gross bout energy from a stored AVERAGE heart rate, for a session whose sample series is not
+    /// worth reading.
+    ///
+    /// Same Keytel rate and same activity gate as `estimateBoutCalories`, evaluated once at the mean
+    /// instead of per sample. It is the weaker of the two and deliberately so: a session's average
+    /// flattens the intervals inside it, and Keytel is not linear in heart rate, so a hard interval
+    /// workout comes out low here. It exists for the callers that already HOLD an average — the
+    /// workout list reconciles one onto every row — and for whom reading the window again would mean
+    /// a per-session query on a path that already has a documented cost problem.
+    ///
+    /// Gross, like its sibling: below the activity gate the whole window is priced at the resting
+    /// rate, above it at the exercise rate, and neither subtracts the resting share.
+    public static func estimateBoutCalories(averageHR: Int, durationSeconds: Double,
+                                            profile: UserProfile,
+                                            hrmax: Double?, restingHR: Double?) -> Double? {
+        guard durationSeconds > 0, durationSeconds.isFinite, averageHR > 0 else { return nil }
+        let weightKg = profile.weightKg > 0 ? profile.weightKg : 70.0
+        let heightCm = profile.heightCm > 0 ? profile.heightCm : 170.0
+        let age = profile.age > 0 ? profile.age : 30.0
+        let coeffs = resolveCoeffs(profile.sex)
+        let effHRmax = hrmax ?? 220.0
+        let effResting = restingHR ?? 60.0
+        let activeThreshold = effResting + activeHRRFraction * (effHRmax - effResting)
+        let bpm = Double(averageHR)
+        guard bpm >= activeThreshold else {
+            return restingKcalPerS(coeffs, weightKg: weightKg, heightCm: heightCm, age: age)
+                * durationSeconds
+        }
+        let vo2max = vo2maxFor(hrmax: effHRmax, restingHR: restingHR)
+        return activeKcalPerS(coeffs, hr: bpm, hrmax: effHRmax, weightKg: weightKg, age: age,
+                              vo2max: vo2max) * durationSeconds
     }
 
     /// APPROXIMATE whole-day resting + active energy estimate from the full day's HR samples.

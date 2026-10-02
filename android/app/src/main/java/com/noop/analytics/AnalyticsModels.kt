@@ -41,15 +41,36 @@ data class UserProfile(
     /** "male" | "female" | "nonbinary". */
     val sex: String = "nonbinary",
     /**
+     * Optional user-tested/manual maximum heart rate. Consumers fall back to Tanaka only when null.
+     *
+     * Twin of Swift `UserProfile.maxHR`.
+     */
+    val maxHr: Double? = null,
+    /**
      * Counter ticks per real step for the @57 motion counter (#139). The WHOOP 5/MG
      * counter overcounts and its true tick rate is unknown, so the daily-steps total
      * divides by this. 1.0 = raw pass-through (default); the engine clamps ≥ 0.5.
      */
     val stepTicksPerStep: Double = 1.0,
     /**
+     * The basal formula `Calories.bmrKcalPerDay(profile)` evaluates. Revised Harris–Benedict by default so
+     * a profile built without one keeps the rate it always had; the app passes the wearer's choice.
+     *
+     * Twin of Swift `UserProfile.basalFormula`.
+     */
+    val basalFormula: BasalFormula = BasalFormula.REVISED_HARRIS_BENEDICT,
+    /**
+     * Body fat in force on the day this profile describes, for Katch–McArdle. Null = no reading.
+     *
+     * Twin of Swift `UserProfile.bodyFatPercent`.
+     */
+    val bodyFatPercent: Double? = null,
+    /**
      * Waist circumference (cm) for the Fitness Age VO₂max estimate (Phase 2). 0 = not set.
      * Optional — it UNLOCKS the VO₂max readout but does NOT sharpen the headline Fitness Age
      * (the body term cancels out of the age formula). Default param so existing call-sites compile.
+     *
+     * NOTE: no Swift counterpart. Android-only since it arrived; see the Android-only block below.
      */
     val waistCm: Double = 0.0,
 ) {
@@ -58,10 +79,15 @@ data class UserProfile(
      * `IntelligenceEngine.loadCacheKey`). Named explicitly rather than read from the generated `toString`,
      * which is not a contract. A new field belongs here too. Doubles by bit pattern, so the key is exact.
      * Twin of Swift `UserProfile.cacheKey`.
+     *
+     * The Swift twin writes its own three added segments in the same order: `,b=<formula>,f=<bits|->`.
+     * Kept append-only at the END so the prefixes existing keys already used are byte-identical — a
+     * cache key that changed shape would silently invalidate every persisted per-cycle load cache.
      */
     val cacheKey: String
         get() = "w=${weightKg.toRawBits()},h=${heightCm.toRawBits()},a=${age.toRawBits()},s=$sex," +
-            "t=${stepTicksPerStep.toRawBits()},waist=${waistCm.toRawBits()}"
+            "t=${stepTicksPerStep.toRawBits()},waist=${waistCm.toRawBits()}" +
+            ",b=${basalFormula.rawValue},f=${bodyFatPercent?.toRawBits() ?: "-"}"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
